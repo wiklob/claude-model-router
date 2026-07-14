@@ -93,6 +93,19 @@ Then a foreign model is just `claude --model gpt-…` or `/model gpt-…` — bi
 - **Non-loopback binds are refused** unless `ROUTER_AUTH_TOKEN` is set; with it set, every request must carry `x-router-token: <token>` (constant-time compared, stripped before forwarding; `/healthz` stays open). Terminate TLS in front of it (reverse proxy) before exposing it beyond localhost — an unprotected relay would hand your route upstreams to anyone who can reach it.
 - **No bodies or credentials are ever logged.** The access log is method, path, upstream host, status, duration.
 
+## Model discovery (`/model` picker integration)
+
+`GET /v1/models` answers with the **merged catalog of every upstream** — default plus all routes, deduped, unreachable upstreams skipped. Pair it with Claude Code's gateway discovery (≥ 2.1.129) so the `/model` picker lists your routed models as "From gateway" entries and `/model <foreign-id>` validates:
+
+```json
+{ "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:8399",
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
+} }
+```
+
+Single-model lookups (`GET /v1/models/<id>`) route by the id in the path. The merged list flattens pagination (`has_more: false`).
+
 ## Behavior details
 
 - Bytes in, bytes out: the request body is buffered once (to peek `model`), then forwarded verbatim; responses — including SSE streams — are piped through unbuffered.

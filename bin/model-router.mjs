@@ -21,7 +21,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '0.1.1';
+const VERSION = '0.2.0';
 // generous ceiling so a malformed client can't balloon memory; real Anthropic
 // requests are far smaller
 const MAX_BODY = 64 * 1024 * 1024;
@@ -122,16 +122,24 @@ function tokenOk(header) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-function forward(req, res, body, upstreamBase) {
+function targetURL(upstreamBase, pathWithQuery) {
   const base = new URL(upstreamBase);
   // preserve an upstream path prefix (e.g. https://host/anthropic + /v1/messages)
-  const target = new URL((base.pathname === '/' ? '' : base.pathname) + req.url, base.origin);
+  return new URL((base.pathname === '/' ? '' : base.pathname) + pathWithQuery, base.origin);
+}
 
+function clientHeaders(reqHeaders) {
   const headers = {};
-  for (const [k, v] of Object.entries(req.headers)) {
+  for (const [k, v] of Object.entries(reqHeaders)) {
     if (HOP.has(k) || k === 'host' || k === 'content-length' || k === 'x-router-token') continue;
     headers[k] = v;
   }
+  return headers;
+}
+
+function forward(req, res, body, upstreamBase) {
+  const target = targetURL(upstreamBase, req.url);
+  const headers = clientHeaders(req.headers);
   if (body.length > 0 || !['GET', 'HEAD'].includes(req.method)) {
     headers['content-length'] = String(body.length);
   }
@@ -164,6 +172,55 @@ function forward(req, res, body, upstreamBase) {
   up.end(body);
 }
 
+// GET /v1/models answers with the MERGED catalog of every upstream, so harness
+// model discovery (e.g. CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1) sees the
+// routed foreign models next to Anthropic's. Unreachable upstreams are skipped;
+// pagination is flattened (has_more: false).
+function fetchModels(upstreamBase, pathWithQuery, headers) {
+  return new Promise((resolve) => {
+    const target = targetURL(upstreamBase, pathWithQuery);
+    const mod = target.protocol === 'https:' ? https : http;
+    const r = mod.request(target, { method: 'GET', headers }, (upRes) => {
+      const chunks = [];
+      upRes.on('data', (c) => chunks.push(c));
+      upRes.on('end', () => {
+        try { resolve({ status: upRes.statusCode, json: JSON.parse(Buffer.concat(chunks).toString('utf8')) }); }
+        catch { resolve(null); }
+      });
+      upRes.on('error', () => resolve(null));
+    });
+    r.on('error', () => resolve(null));
+    r.setTimeout(5000, () => { r.destroy(); resolve(null); });
+    r.end();
+  });
+}
+
+async function mergedModels(req, res, cfg) {
+  const path = req.url.includes('?') ? req.url : `${req.url}?limit=1000`;
+  const headers = clientHeaders(req.headers);
+  const upstreams = [cfg.defaultUpstream, ...new Set(cfg.routes.map((r) => r.upstream))];
+  const results = await Promise.all(upstreams.map((u) => fetchModels(u, path, headers)));
+  const seen = new Set();
+  const data = [];
+  for (const r of results) {
+    for (const m of (Array.isArray(r?.json?.data) ? r.json.data : [])) {
+      if (m && typeof m.id === 'string' && !seen.has(m.id)) { seen.add(m.id); data.push(m); }
+    }
+  }
+  const primary = results[0];
+  if (data.length === 0) {
+    res.writeHead(primary?.status ?? 502, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(primary?.json
+      ?? { type: 'error', error: { type: 'upstream_unreachable', message: 'no upstream answered /v1/models' } }));
+    return;
+  }
+  const body = { ...(primary?.json && typeof primary.json === 'object' ? primary.json : {}), data, has_more: false };
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(body));
+  process.stdout.write(
+    `${new Date().toISOString()} GET ${req.url} -> merged catalog (${data.length} models from ${results.filter(Boolean).length}/${upstreams.length} upstreams)\n`);
+}
+
 function handle(req, res) {
   res.socket?.setNoDelay(true);
   const cfg = currentConfig();
@@ -177,6 +234,17 @@ function handle(req, res) {
   if (AUTH_TOKEN && !tokenOk(req.headers['x-router-token'])) {
     res.writeHead(401, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'missing or wrong x-router-token' } }));
+    return;
+  }
+
+  const plainPath = req.url.split('?')[0];
+  if (req.method === 'GET' && plainPath === '/v1/models') {
+    mergedModels(req, res, cfg);
+    return;
+  }
+  if (req.method === 'GET' && plainPath.startsWith('/v1/models/')) {
+    // single-model lookup: route by the id in the path
+    forward(req, res, Buffer.alloc(0), pickUpstream(cfg, decodeURIComponent(plainPath.slice('/v1/models/'.length))));
     return;
   }
 

@@ -31,6 +31,12 @@ setTimeout(() => { console.log('FAIL: probe timed out'); process.exit(1); }, 30_
 
 // --- fake upstreams -------------------------------------------------------------
 
+const CATALOGS = {
+  A: [{ id: 'claude-x', type: 'model' }, { id: 'shared-model', type: 'model' }],
+  B: [{ id: 'gpt-1', type: 'model' }, { id: 'shared-model', type: 'model' }],
+  C: [{ id: 'gpt-sol', type: 'model' }],
+};
+
 function mkFake(name) {
   const requests = [];
   const server = http.createServer((req, res) => {
@@ -39,6 +45,11 @@ function mkFake(name) {
     req.on('end', () => {
       const body = Buffer.concat(chunks);
       requests.push({ method: req.method, url: req.url, headers: req.headers, body });
+      if (req.method === 'GET' && req.url.split('?')[0] === '/v1/models') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ data: CATALOGS[name], has_more: true, first_id: 'x' }));
+        return;
+      }
       let parsed;
       try { parsed = JSON.parse(body.toString('utf8')); } catch { /* fine */ }
       if (parsed?.stream === true) {
@@ -162,8 +173,27 @@ const P = router.port;
 
 // 5. Bodyless request → default upstream.
 {
+  const res = await request(P, { method: 'GET', path: '/v1/organizations/me' });
+  check(res.headers['x-served-by'] === 'A' && A.requests.at(-1)?.url === '/v1/organizations/me', 'default: bodyless GET goes to default upstream');
+}
+
+// 5b. GET /v1/models → merged catalog across all upstreams, dead one skipped.
+{
   const res = await request(P, { method: 'GET', path: '/v1/models' });
-  check(res.headers['x-served-by'] === 'A' && A.requests.at(-1)?.url === '/v1/models', 'default: bodyless GET goes to default upstream');
+  const j = JSON.parse(res.body.toString());
+  const ids = j.data.map((m) => m.id);
+  check(res.status === 200
+     && ids.includes('claude-x') && ids.includes('gpt-1') && ids.includes('gpt-sol')
+     && ids.filter((i) => i === 'shared-model').length === 1
+     && j.has_more === false,
+    `models: merged catalog, deduped, dead upstream skipped (${ids.join(',')})`);
+  check(A.requests.at(-1)?.url === '/v1/models?limit=1000', 'models: default upstream queried with a high page limit');
+}
+
+// 5c. GET /v1/models/<id> routes by the id in the path.
+{
+  await request(P, { method: 'GET', path: '/v1/models/gpt-5.6-mini' });
+  check(B.requests.at(-1)?.url === '/v1/models/gpt-5.6-mini', 'models: single-model lookup follows the route');
 }
 
 // 6. Non-JSON body → forwarded verbatim to default upstream (upstream's problem).
