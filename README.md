@@ -19,18 +19,25 @@ After that, model choice is just `--model` / `/model` — per session, switchabl
 
 ## Quickstart
 
+Via npm:
+
+```bash
+npm install -g claude-model-router
+model-router install-launchd         # macOS: persistent LaunchAgent (KeepAlive),
+                                     # seeds ~/.config/claude-model-router/config.json
+```
+
+or from a checkout:
+
 ```bash
 git clone https://github.com/wiklob/claude-model-router.git
 cd claude-model-router
 node bin/model-router.mjs --config config.example.json   # foreground trial run
-```
-
-Persistent install (macOS LaunchAgent, KeepAlive, seeds `~/.config/claude-model-router/config.json`):
-
-```bash
-bash install-launchd.sh              # install / reinstall
+bash install-launchd.sh                                  # persistent install
 bash install-launchd.sh --uninstall
 ```
+
+(`npx claude-model-router` works for a foreground trial too, but don't `install-launchd` from npx — the LaunchAgent would point into the disposable npx cache. Persistence wants a global install or a checkout.)
 
 Point Claude Code at it — in `~/.claude/settings.json`:
 

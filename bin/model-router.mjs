@@ -18,6 +18,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 
 const VERSION = '0.1.0';
 // generous ceiling so a malformed client can't balloon memory; real Anthropic
@@ -36,6 +38,7 @@ const AUTH_TOKEN = process.env.ROUTER_AUTH_TOKEN || '';
 function usage() {
   return `claude-model-router ${VERSION}
 Usage: model-router [--config <path>] [--check] [--version] [--help]
+       model-router install-launchd [--uninstall]   (macOS: persistent LaunchAgent)
 Config resolution: --config > $MODEL_ROUTER_CONFIG > ~/.config/claude-model-router/config.json`;
 }
 
@@ -198,6 +201,15 @@ function handle(req, res) {
 // --- startup ------------------------------------------------------------------
 
 const argv = process.argv.slice(2);
+
+// subcommand: hand off to the installer script that ships in the package,
+// wherever the package lives (git checkout or npm install)
+if (argv[0] === 'install-launchd') {
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'install-launchd.sh');
+  const r = spawnSync('bash', [script, ...argv.slice(1)], { stdio: 'inherit' });
+  process.exit(r.status ?? 1);
+}
+
 let configFlag = null;
 let checkOnly = false;
 for (let i = 0; i < argv.length; i++) {

@@ -255,6 +255,21 @@ router.proc.kill();
   check(code === 1 && err.includes('not valid JSON'), 'startup: invalid config rejected');
 }
 
+// 15. install-launchd subcommand wires through to the shipped installer
+// (the uninstall path is side-effect-free when nothing is installed).
+{
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'router-home-'));
+  const proc = spawn(process.execPath, [BIN, 'install-launchd', '--uninstall'], {
+    env: { ...process.env, HOME: fakeHome },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let out = '';
+  proc.stdout.on('data', (d) => { out += d; });
+  const code = await waitExit(proc);
+  check(code === 0 && out.includes('uninstalled'), 'cli: install-launchd subcommand reaches the installer');
+  fs.rmSync(fakeHome, { recursive: true, force: true });
+}
+
 for (const f of [A, B, C]) f.server.close();
 fs.rmSync(TMP, { recursive: true, force: true });
 

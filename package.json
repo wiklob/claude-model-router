@@ -4,7 +4,25 @@
   "description": "Tiny local router for the Anthropic API surface: peek at the model id, forward the bytes. Claude ids pass through to Anthropic untouched; foreign ids go to your translating proxy.",
   "type": "module",
   "bin": { "model-router": "bin/model-router.mjs" },
-  "scripts": { "test": "node test/router.test.mjs" },
+  "files": [
+    "bin/",
+    "install-launchd.sh",
+    "config.example.json"
+  ],
+  "scripts": {
+    "test": "node test/router.test.mjs",
+    "prepublishOnly": "npm test"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "router",
+    "proxy",
+    "multi-model",
+    "cliproxyapi"
+  ],
+  "author": "wiklob",
   "engines": { "node": ">=18" },
   "repository": { "type": "git", "url": "https://github.com/wiklob/claude-model-router.git" },
   "license": "MIT"
