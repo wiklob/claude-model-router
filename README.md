@@ -66,12 +66,12 @@ Escape hatch: delete the `env` line and new sessions go direct to Anthropic agai
   "listen": { "host": "127.0.0.1", "port": 8399 },
   "defaultUpstream": "https://api.anthropic.com",
   "routes": [
-    { "match": "gpt-*", "upstream": "http://localhost:8317" }
+    { "match": ["gpt-*", "chatgpt-*", "codex-*", "o1*", "o3*", "o4*"], "upstream": "http://localhost:8317" }
   ]
 }
 ```
 
-- `match` — exact model id, or a prefix ending in `*`. First matching route wins; no match (and any request without a parseable `model`) → `defaultUpstream`.
+- `match` — one pattern or an array of them; a pattern is an exact model id, or a prefix ending in `*`. First matching route wins; no match (and any request without a parseable `model`) → `defaultUpstream`.
 - `upstream` — any base URL speaking the Anthropic API surface; a path prefix is preserved.
 - Edits apply on the next request (content-compare reload); a broken edit is ignored with a warning and the last good config keeps serving.
 - `--check` validates a config and prints the resolved table.

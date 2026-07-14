@@ -21,7 +21,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 // generous ceiling so a malformed client can't balloon memory; real Anthropic
 // requests are far smaller
 const MAX_BODY = 64 * 1024 * 1024;
@@ -48,15 +48,20 @@ function defaultConfigPath() {
 }
 
 function compileRoute(r, i) {
-  if (!r || typeof r.match !== 'string' || typeof r.upstream !== 'string') {
-    throw new Error(`routes[${i}]: need string "match" and string "upstream"`);
+  const patterns = Array.isArray(r?.match) ? r.match : [r?.match];
+  if (!r || patterns.length === 0 || !patterns.every((p) => typeof p === 'string' && p.length > 0)
+      || typeof r.upstream !== 'string') {
+    throw new Error(`routes[${i}]: need "match" (string or string array) and string "upstream"`);
   }
   new URL(r.upstream); // throws on a malformed upstream
-  const pattern = r.match;
-  const test = pattern.endsWith('*')
-    ? (id) => id.startsWith(pattern.slice(0, -1))
-    : (id) => id === pattern;
-  return { match: pattern, upstream: r.upstream.replace(/\/+$/, ''), test };
+  const tests = patterns.map((p) => p.endsWith('*')
+    ? (id) => id.startsWith(p.slice(0, -1))
+    : (id) => id === p);
+  return {
+    match: patterns.join(', '),
+    upstream: r.upstream.replace(/\/+$/, ''),
+    test: (id) => tests.some((t) => t(id)),
+  };
 }
 
 function parseConfig(raw, file) {
@@ -261,5 +266,14 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 2000).unref();
+  });
+}
+
+// Last resort: a router dying takes the API path down for every session at
+// once, so an unexpected error is logged with its trace and survived. Known
+// error paths handle themselves above; this only catches what they miss.
+for (const evt of ['uncaughtException', 'unhandledRejection']) {
+  process.on(evt, (err) => {
+    process.stderr.write(`[model-router] ${new Date().toISOString()} ${evt} (surviving): ${err?.stack || err}\n`);
   });
 }

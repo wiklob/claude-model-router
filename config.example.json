@@ -3,6 +3,6 @@
   "listen": { "host": "127.0.0.1", "port": 8399 },
   "defaultUpstream": "https://api.anthropic.com",
   "routes": [
-    { "match": "gpt-*", "upstream": "http://localhost:8317" }
+    { "match": ["gpt-*", "chatgpt-*", "codex-*", "o1*", "o3*", "o4*"], "upstream": "http://localhost:8317" }
   ]
 }

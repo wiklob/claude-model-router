@@ -109,7 +109,7 @@ const baseConfig = {
   defaultUpstream: `http://127.0.0.1:${A.port}`,
   routes: [
     { match: 'gpt-5.6-sol', upstream: `http://127.0.0.1:${C.port}` },
-    { match: 'gpt-*', upstream: `http://127.0.0.1:${B.port}` },
+    { match: ['gpt-*', 'grok-*'], upstream: `http://127.0.0.1:${B.port}` },
     { match: 'dead-*', upstream: 'http://127.0.0.1:1' },
   ],
 };
@@ -139,10 +139,12 @@ const P = router.port;
   check(seen?.url === '/v1/messages', 'default: path preserved');
 }
 
-// 2. Prefix route.
+// 2. Prefix route — and a second pattern in the same route's match array.
 {
   const res = await request(P, { body: JSON.stringify({ model: 'gpt-5.6-mini' }), headers: { 'content-type': 'application/json' } });
   check(res.headers['x-served-by'] === 'B', 'route: gpt-* prefix match forwards to its upstream');
+  const res2 = await request(P, { body: JSON.stringify({ model: 'grok-3' }), headers: { 'content-type': 'application/json' } });
+  check(res2.headers['x-served-by'] === 'B', 'route: array-form match — any pattern in the list selects the route');
 }
 
 // 3. First-match-wins ordering (exact listed before prefix).
@@ -215,9 +217,28 @@ const P = router.port;
   fs.writeFileSync(CONFIG, JSON.stringify(baseConfig, null, 2));
 }
 
+// 12. Mid-stream client abort must not take the router down.
+{
+  const aborter = await new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: '127.0.0.1', port: P, method: 'POST', path: '/v1/messages' },
+      (res) => res.once('data', () => resolve(req)),  // first SSE chunk arrived — abort now
+    );
+    req.on('error', () => {});                        // our own teardown noise is expected
+    req.end(JSON.stringify({ model: 'claude-fable-5', stream: true }));
+    setTimeout(() => reject(new Error('no first chunk')), 3000);
+  });
+  aborter.destroy();
+  await new Promise((r) => setTimeout(r, 250));       // give a crash time to happen
+  const alive = await request(P, { method: 'GET', path: '/healthz' });
+  check(alive.status === 200, 'abort: router survives a client vanishing mid-stream');
+  const after = await request(P, { body: JSON.stringify({ model: 'gpt-5.6-mini' }) });
+  check(after.headers['x-served-by'] === 'B', 'abort: routing still works after the abort');
+}
+
 router.proc.kill();
 
-// 12. ROUTER_AUTH_TOKEN set → enforced, and the token header is stripped upstream.
+// 13. ROUTER_AUTH_TOKEN set → enforced, and the token header is stripped upstream.
 {
   const authed = await startRouter(CONFIG, { ROUTER_AUTH_TOKEN: 'sekrit-42' });
   const noTok = await request(authed.port, { body: JSON.stringify({ model: 'claude-x' }) });
@@ -233,7 +254,7 @@ router.proc.kill();
   authed.proc.kill();
 }
 
-// 13. Non-loopback bind without a token refuses to start.
+// 14. Non-loopback bind without a token refuses to start.
 {
   const openCfg = path.join(TMP, 'open.json');
   fs.writeFileSync(openCfg, JSON.stringify({ ...baseConfig, listen: { host: '0.0.0.0', port: 0 } }));
@@ -244,7 +265,7 @@ router.proc.kill();
   check(code === 1 && err.includes('ROUTER_AUTH_TOKEN'), 'bind: non-loopback without ROUTER_AUTH_TOKEN refuses to start');
 }
 
-// 14. Invalid config at startup → exit 1 with message.
+// 15. Invalid config at startup → exit 1 with message.
 {
   const badCfg = path.join(TMP, 'bad.json');
   fs.writeFileSync(badCfg, '{ nope');
@@ -255,18 +276,26 @@ router.proc.kill();
   check(code === 1 && err.includes('not valid JSON'), 'startup: invalid config rejected');
 }
 
-// 15. install-launchd subcommand wires through to the shipped installer
-// (the uninstall path is side-effect-free when nothing is installed).
+// 16. install-launchd subcommand wires through to the shipped installer.
+// HERMETIC: launchctl is stubbed via PATH — the real launchd domain must
+// never be touched (an earlier version of this case booted the machine's
+// LIVE router out of launchd because fake-HOME does not redirect launchctl).
 {
   const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'router-home-'));
+  const stubBin = path.join(fakeHome, 'stub-bin');
+  fs.mkdirSync(stubBin);
+  const stubLog = path.join(fakeHome, 'launchctl-calls.log');
+  fs.writeFileSync(path.join(stubBin, 'launchctl'), `#!/bin/sh\necho "$@" >> "${stubLog}"\nexit 0\n`, { mode: 0o755 });
   const proc = spawn(process.execPath, [BIN, 'install-launchd', '--uninstall'], {
-    env: { ...process.env, HOME: fakeHome },
+    env: { ...process.env, HOME: fakeHome, PATH: `${stubBin}:${process.env.PATH}` },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let out = '';
   proc.stdout.on('data', (d) => { out += d; });
   const code = await waitExit(proc);
   check(code === 0 && out.includes('uninstalled'), 'cli: install-launchd subcommand reaches the installer');
+  const calls = fs.existsSync(stubLog) ? fs.readFileSync(stubLog, 'utf8') : '';
+  check(calls.includes('bootout'), 'cli: launchctl was intercepted by the stub, not the real domain');
   fs.rmSync(fakeHome, { recursive: true, force: true });
 }
 
