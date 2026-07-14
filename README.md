@@ -39,13 +39,23 @@ bash install-launchd.sh --uninstall
 
 (`npx @wiklob/claude-model-router` works for a foreground trial too, but don't `install-launchd` from npx — the LaunchAgent would point into the disposable npx cache. Persistence wants a global install or a checkout.)
 
-Point Claude Code at it — in `~/.claude/settings.json`:
+Point Claude Code at it — add a top-level `env` key in `~/.claude/settings.json`:
 
 ```json
 { "env": { "ANTHROPIC_BASE_URL": "http://localhost:8399" } }
 ```
 
-or per shell: `export ANTHROPIC_BASE_URL=http://localhost:8399`. Then `claude --model <anything>`.
+or per shell: `export ANTHROPIC_BASE_URL=http://localhost:8399`. This URL is a loopback pointer, not a secret — it's fine in a tracked settings file; credentials never go in the `env` block. **New sessions only**: already-open sessions keep their environment.
+
+Verify the chain end-to-end:
+
+```bash
+curl http://127.0.0.1:8399/healthz
+claude -p "Reply with exactly: VIA-ROUTER"                # no env prefix — settings supplies it
+tail -3 ~/Library/Logs/claude-model-router.log            # your request is the last line
+```
+
+Escape hatch: delete the `env` line and new sessions go direct to Anthropic again.
 
 ## Configuration
 
@@ -67,6 +77,15 @@ or per shell: `export ANTHROPIC_BASE_URL=http://localhost:8399`. Then `claude --
 - `--check` validates a config and prints the resolved table.
 
 **No credentials, ever, in this file.** The router carries the caller's own headers through untouched.
+
+## Pairing with a translating proxy (foreign models)
+
+For non-Anthropic models, point a route at a proxy that speaks the Anthropic API surface and translates behind it — e.g. CLIProxyAPI on `localhost:8317`, holding your OpenAI/provider login. Two things to know:
+
+- **Run it with inbound auth off** (loopback-only). Your sessions present *Anthropic* auth headers, and the router forwards them as-is to whichever upstream wins the route — a proxy demanding its own inbound API key would reject them.
+- Until the proxy is running, its routed models fail fast with a clean `502` from the router; your default-upstream (Claude) traffic is unaffected either way.
+
+Then a foreign model is just `claude --model gpt-…` or `/model gpt-…` — billed by whatever account the proxy is signed into.
 
 ## Security model
 
