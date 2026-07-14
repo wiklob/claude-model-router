@@ -1,0 +1,8 @@
+{
+  "notes": "Copy to ~/.config/claude-model-router/config.json and edit. Requests whose JSON body carries a `model` matching a route (exact id, or a trailing-* prefix; first match wins) are forwarded to that route's upstream; everything else — including all claude-* ids — goes to defaultUpstream with the caller's auth headers untouched. Upstreams for foreign models must speak the Anthropic API surface themselves (a translating proxy such as CLIProxyAPI). NEVER put credentials in this file; the only router credential is the optional ROUTER_AUTH_TOKEN env var, required for (and only enforced with) non-loopback binds.",
+  "listen": { "host": "127.0.0.1", "port": 8399 },
+  "defaultUpstream": "https://api.anthropic.com",
+  "routes": [
+    { "match": "gpt-*", "upstream": "http://localhost:8317" }
+  ]
+}
