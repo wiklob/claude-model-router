@@ -21,7 +21,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 // generous ceiling so a malformed client can't balloon memory; real Anthropic
 // requests are far smaller
 const MAX_BODY = 64 * 1024 * 1024;
@@ -47,6 +47,11 @@ function defaultConfigPath() {
     || path.join(os.homedir(), '.config', 'claude-model-router', 'config.json');
 }
 
+// exact id, or trailing-* prefix — the one pattern syntax used everywhere
+function patternTest(p) {
+  return p.endsWith('*') ? (id) => id.startsWith(p.slice(0, -1)) : (id) => id === p;
+}
+
 function compileRoute(r, i) {
   const patterns = Array.isArray(r?.match) ? r.match : [r?.match];
   if (!r || patterns.length === 0 || !patterns.every((p) => typeof p === 'string' && p.length > 0)
@@ -54,9 +59,7 @@ function compileRoute(r, i) {
     throw new Error(`routes[${i}]: need "match" (string or string array) and string "upstream"`);
   }
   new URL(r.upstream); // throws on a malformed upstream
-  const tests = patterns.map((p) => p.endsWith('*')
-    ? (id) => id.startsWith(p.slice(0, -1))
-    : (id) => id === p);
+  const tests = patterns.map(patternTest);
   return {
     match: patterns.join(', '),
     upstream: r.upstream.replace(/\/+$/, ''),
@@ -91,6 +94,28 @@ function parseGuard(g, file) {
   return { maxConcurrent, dailyBudget, scope, stateFile, breakerThreshold, breakerCooloffMinutes };
 }
 
+// The catalog block shapes what GET /v1/models advertises — display only,
+// routing is never affected: a hidden model still routes and completes.
+function parseCatalog(c) {
+  if (c == null) return null;
+  const hidePatterns = c.hide == null ? [] : (Array.isArray(c.hide) ? c.hide : [c.hide]);
+  if (!hidePatterns.every((p) => typeof p === 'string' && p.length > 0)) {
+    throw new Error('catalog.hide: need a string or string array of model-id patterns');
+  }
+  const aliases = c.aliases ?? {};
+  if (typeof aliases !== 'object' || Array.isArray(aliases)
+      || !Object.entries(aliases).every(([k, v]) => k.length > 0 && typeof v === 'string' && v.length > 0)) {
+    throw new Error('catalog.aliases: need an object of { "model-id": "Display Name" }');
+  }
+  if (hidePatterns.length === 0 && Object.keys(aliases).length === 0) return null;
+  const tests = hidePatterns.map(patternTest);
+  return {
+    hide: (id) => tests.some((t) => t(id)),
+    hideList: hidePatterns.join(', '),
+    aliases,
+  };
+}
+
 function parseConfig(raw, file) {
   let cfg;
   try {
@@ -105,7 +130,8 @@ function parseConfig(raw, file) {
   new URL(defaultUpstream);
   const routes = (cfg.routes || []).map(compileRoute);
   const guard = parseGuard(cfg.guard, file);
-  return { raw, host, port, defaultUpstream: defaultUpstream.replace(/\/+$/, ''), routes, guard };
+  const catalog = parseCatalog(cfg.catalog);
+  return { raw, host, port, defaultUpstream: defaultUpstream.replace(/\/+$/, ''), routes, guard, catalog };
 }
 
 // Config is re-read per request by content comparison (files this small make
@@ -392,11 +418,19 @@ async function mergedModels(req, res, cfg) {
   const upstreams = [cfg.defaultUpstream, ...new Set(cfg.routes.map((r) => r.upstream))];
   const results = await Promise.all(upstreams.map((u) => fetchModels(u, path, headers)));
   const seen = new Set();
-  const data = [];
+  let data = [];
   for (const r of results) {
     for (const m of (Array.isArray(r?.json?.data) ? r.json.data : [])) {
       if (m && typeof m.id === 'string' && !seen.has(m.id)) { seen.add(m.id); data.push(m); }
     }
+  }
+  let hidden = 0;
+  if (cfg.catalog) {
+    const before = data.length;
+    data = data
+      .filter((m) => !cfg.catalog.hide(m.id))
+      .map((m) => cfg.catalog.aliases[m.id] ? { ...m, display_name: cfg.catalog.aliases[m.id] } : m);
+    hidden = before - data.length;
   }
   const primary = results[0];
   if (data.length === 0) {
@@ -409,7 +443,8 @@ async function mergedModels(req, res, cfg) {
   res.writeHead(200, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
   process.stdout.write(
-    `${new Date().toISOString()} GET ${req.url} -> merged catalog (${data.length} models from ${results.filter(Boolean).length}/${upstreams.length} upstreams)\n`);
+    `${new Date().toISOString()} GET ${req.url} -> merged catalog (${data.length} models from ${results.filter(Boolean).length}/${upstreams.length} upstreams`
+    + `${hidden > 0 ? `, ${hidden} hidden` : ''})\n`);
 }
 
 function handle(req, res) {
@@ -510,6 +545,10 @@ if (checkOnly) {
   if (config.guard) {
     process.stdout.write(`  guard   scope=${config.guard.scope} maxConcurrent=${config.guard.maxConcurrent ?? '-'} `
       + `dailyBudget=${config.guard.dailyBudget ?? '-'} state=${config.guard.stateFile}\n`);
+  }
+  if (config.catalog) {
+    process.stdout.write(`  catalog hide=[${config.catalog.hideList || '-'}] `
+      + `aliases=${Object.keys(config.catalog.aliases).length}\n`);
   }
   process.exit(0);
 }

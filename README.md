@@ -124,6 +124,24 @@ Then a foreign model is just `claude --model gpt-…` or `/model gpt-…` — bi
 
 Single-model lookups (`GET /v1/models/<id>`) route by the id in the path. The merged list flattens pagination (`has_more: false`).
 
+### Curating the catalog
+
+Upstream catalogs are often noisy (duplicate variants, image models, internal aliases). The optional `catalog` config block shapes the merged list — **display only**, routing is never affected: a hidden model still routes and completes, it just stops appearing in pickers.
+
+```json
+"catalog": {
+  "hide": ["gpt-image-*", "sol", "terra", "luna"],
+  "aliases": { "gpt-5.6-sol": "GPT 5.6 Sol (Codex Pro)" }
+}
+```
+
+- `hide` — patterns (exact id, or trailing-`*` prefix) removed from the merged `/v1/models` response.
+- `aliases` — model id → the `display_name` pickers show for it.
+
+Edits hot-reload like the rest of the config; reopen the `/model` picker (new session) to see the effect.
+
+Note: Claude Code's own variant tags such as `sonnet[1m]` are client-side ids that never appear in any upstream catalog, so under gateway discovery the picker classifies them as "custom model". That's cosmetic — the request still routes to `defaultUpstream` unchanged; the router can't fix the label.
+
 ## Behavior details
 
 - Bytes in, bytes out: the request body is buffered once (to peek `model`), then forwarded verbatim; responses — including SSE streams — are piped through unbuffered.

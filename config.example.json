@@ -1,9 +1,13 @@
 {
-  "notes": "Copy to ~/.config/claude-model-router/config.json and edit. Requests whose JSON body carries a `model` matching a route (exact id, or a trailing-* prefix; first match wins) are forwarded to that route's upstream; everything else — including all claude-* ids — goes to defaultUpstream with the caller's auth headers untouched. Upstreams for foreign models must speak the Anthropic API surface themselves (a translating proxy such as CLIProxyAPI). The optional `guard` block is a hard stop for metered upstreams: completion POSTs beyond `maxConcurrent` in-flight or `dailyBudget` per local day answer a non-retryable 403 telling the agent to stop and hand off to a human (reset a tripped budget by deleting guard-state.json next to this file; scope `routed` guards only route upstreams, `all` includes defaultUpstream). NEVER put credentials in this file; the only router credential is the optional ROUTER_AUTH_TOKEN env var, required for (and only enforced with) non-loopback binds.",
+  "notes": "Copy to ~/.config/claude-model-router/config.json and edit. Requests whose JSON body carries a `model` matching a route (exact id, or a trailing-* prefix; first match wins) are forwarded to that route's upstream; everything else — including all claude-* ids — goes to defaultUpstream with the caller's auth headers untouched. Upstreams for foreign models must speak the Anthropic API surface themselves (a translating proxy such as CLIProxyAPI). The optional `catalog` block shapes what GET /v1/models advertises (display only — a hidden model still routes and completes): `hide` is a pattern list (exact id or trailing-*) removed from the merged list, `aliases` maps a model id to the display_name shown by pickers. The optional `guard` block is a hard stop for metered upstreams: completion POSTs beyond `maxConcurrent` in-flight or `dailyBudget` per local day answer a non-retryable 403 telling the agent to stop and hand off to a human (reset a tripped budget by deleting guard-state.json next to this file; scope `routed` guards only route upstreams, `all` includes defaultUpstream). NEVER put credentials in this file; the only router credential is the optional ROUTER_AUTH_TOKEN env var, required for (and only enforced with) non-loopback binds.",
   "listen": { "host": "127.0.0.1", "port": 8399 },
   "defaultUpstream": "https://api.anthropic.com",
   "routes": [
     { "match": ["gpt-*", "chatgpt-*", "codex-*", "o1*", "o3*", "o4*"], "upstream": "http://localhost:8317" }
   ],
-  "guard": { "maxConcurrent": 12, "dailyBudget": 3000, "scope": "routed" }
+  "guard": { "maxConcurrent": 12, "dailyBudget": 3000, "scope": "routed" },
+  "catalog": {
+    "hide": ["gpt-image-*"],
+    "aliases": { "gpt-5.6-sol": "GPT 5.6 Sol (Codex Pro)" }
+  }
 }
