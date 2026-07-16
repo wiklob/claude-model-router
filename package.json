@@ -1,6 +1,6 @@
 {
   "name": "@wiklob/claude-model-router",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publishConfig": { "access": "public" },
   "description": "Tiny local router for the Anthropic API surface: peek at the model id, forward the bytes. Claude ids pass through to Anthropic untouched; foreign ids go to your translating proxy.",
   "type": "module",

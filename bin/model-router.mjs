@@ -21,7 +21,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 // generous ceiling so a malformed client can't balloon memory; real Anthropic
 // requests are far smaller
 const MAX_BODY = 64 * 1024 * 1024;
@@ -64,6 +64,26 @@ function compileRoute(r, i) {
   };
 }
 
+function parseGuard(g, file) {
+  if (g == null) return null;
+  const posInt = (v, name) => {
+    if (v == null) return null;
+    if (!Number.isInteger(v) || v < 1) throw new Error(`guard.${name}: need a positive integer or omit`);
+    return v;
+  };
+  const maxConcurrent = posInt(g.maxConcurrent, 'maxConcurrent');
+  const dailyBudget = posInt(g.dailyBudget, 'dailyBudget');
+  if (maxConcurrent === null && dailyBudget === null) {
+    throw new Error('guard: set maxConcurrent and/or dailyBudget (or remove the block)');
+  }
+  const scope = g.scope ?? 'routed';
+  if (scope !== 'routed' && scope !== 'all') throw new Error('guard.scope: "routed" or "all"');
+  const stateFile = typeof g.stateFile === 'string' && g.stateFile.length > 0
+    ? g.stateFile
+    : path.join(path.dirname(file), 'guard-state.json');
+  return { maxConcurrent, dailyBudget, scope, stateFile };
+}
+
 function parseConfig(raw, file) {
   let cfg;
   try {
@@ -77,7 +97,8 @@ function parseConfig(raw, file) {
   const defaultUpstream = cfg.defaultUpstream || 'https://api.anthropic.com';
   new URL(defaultUpstream);
   const routes = (cfg.routes || []).map(compileRoute);
-  return { raw, host, port, defaultUpstream: defaultUpstream.replace(/\/+$/, ''), routes };
+  const guard = parseGuard(cfg.guard, file);
+  return { raw, host, port, defaultUpstream: defaultUpstream.replace(/\/+$/, ''), routes, guard };
 }
 
 // Config is re-read per request by content comparison (files this small make
@@ -113,6 +134,125 @@ function pickUpstream(cfg, model) {
     for (const r of cfg.routes) if (r.test(model)) return r.upstream;
   }
   return cfg.defaultUpstream;
+}
+
+// --- budget guard ---------------------------------------------------------------
+//
+// Hard stop against runaway agent fleets burning a metered upstream (the
+// 2026-07-15 incident: ~25k completions in one afternoon killed a weekly
+// quota). Counts completion POSTs (/v1/messages, not count_tokens) per
+// upstream: an in-flight ceiling and a per-local-day budget. A breach answers
+// 403 — a status the Anthropic SDK does NOT retry, so a hot fleet gets one
+// terminal error per caller instead of a 429 retry storm — with a message
+// telling the agent to stop and hand off to a human. Humans reset a tripped
+// day budget by deleting the state file; the concurrency ceiling self-heals
+// as in-flight requests drain. Day counts persist across restarts.
+
+const inflight = new Map();   // upstream -> live completion count
+let dayKey = '';              // local calendar day the counts belong to
+let dayCounts = new Map();    // upstream -> completions today
+let guardDirty = false;
+let guardStateFile = null;    // last stateFile we loaded/saved (follows config)
+
+function localDayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function loadGuardState(file) {
+  guardStateFile = file;
+  try {
+    const s = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (s && s.day === localDayKey() && s.counts && typeof s.counts === 'object') {
+      dayKey = s.day;
+      dayCounts = new Map(Object.entries(s.counts).filter(([, v]) => Number.isInteger(v)));
+      return;
+    }
+  } catch { /* absent or unreadable — start fresh */ }
+  dayKey = localDayKey();
+  dayCounts = new Map();
+  // write the fresh state eagerly: reset-by-deletion below relies on the
+  // file's absence MEANING a human deleted it, not "not flushed yet"
+  saveGuardState();
+}
+
+function saveGuardState() {
+  if (!guardStateFile) return;
+  guardDirty = false;
+  try {
+    fs.writeFileSync(guardStateFile,
+      JSON.stringify({ day: dayKey, counts: Object.fromEntries(dayCounts) }));
+  } catch (e) {
+    process.stderr.write(`[model-router] guard state write failed: ${e.message}\n`);
+  }
+}
+
+function rollGuardDay() {
+  const today = localDayKey();
+  if (dayKey !== today) {
+    dayKey = today;
+    dayCounts = new Map();
+    guardDirty = true;
+  }
+}
+
+function isCompletionPost(req) {
+  return req.method === 'POST' && req.url.split('?')[0] === '/v1/messages';
+}
+
+function guardDeny(res, message, reason, upstream) {
+  res.writeHead(403, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message } }));
+  process.stdout.write(`${new Date().toISOString()} GUARD deny (${reason}) -> ${upstream}\n`);
+}
+
+// Returns null when the request may proceed (after counting it, with a
+// release handler armed on `res`), or ends the response itself and returns
+// the denial reason.
+function applyGuard(cfg, req, res, upstream) {
+  const g = cfg.guard;
+  if (!g || !isCompletionPost(req)) return null;
+  if (g.scope === 'routed' && upstream === cfg.defaultUpstream) return null;
+  if (g.stateFile !== guardStateFile) loadGuardState(g.stateFile);
+  rollGuardDay();
+
+  const live = inflight.get(upstream) ?? 0;
+  if (g.maxConcurrent !== null && live >= g.maxConcurrent) {
+    guardDeny(res,
+      `model-router guard: concurrency ceiling (${g.maxConcurrent}) reached for ${upstream}. `
+      + 'HARD STOP — do not retry and do not spawn more agents; in-flight requests must drain first. '
+      + 'If this persists, report it to the human.',
+      'concurrency', upstream);
+    return 'concurrency';
+  }
+
+  const used = dayCounts.get(upstream) ?? 0;
+  if (g.dailyBudget !== null && used >= g.dailyBudget) {
+    // a deleted state file is the human's reset switch
+    if (!fs.existsSync(g.stateFile)) {
+      dayCounts = new Map();
+      saveGuardState(); // re-create immediately so absence stays meaningful
+      process.stderr.write(`[model-router] guard: state file removed — day budget reset by human\n`);
+    } else {
+      guardDeny(res,
+        `model-router guard: daily budget (${g.dailyBudget} completions) exhausted for ${upstream}. `
+        + 'HARD STOP — do not retry, do not respawn agents, and do not switch routes to evade this. '
+        + `Report to the human; they reset it by deleting ${g.stateFile}.`,
+        'budget', upstream);
+      return 'budget';
+    }
+  }
+
+  inflight.set(upstream, (inflight.get(upstream) ?? 0) + 1);
+  dayCounts.set(upstream, (dayCounts.get(upstream) ?? 0) + 1);
+  guardDirty = true;
+  let released = false;
+  res.on('close', () => {
+    if (released) return;
+    released = true;
+    inflight.set(upstream, Math.max(0, (inflight.get(upstream) ?? 1) - 1));
+  });
+  return null;
 }
 
 function tokenOk(header) {
@@ -227,7 +367,13 @@ function handle(req, res) {
 
   if (req.url === '/healthz') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, version: VERSION, defaultUpstream: cfg.defaultUpstream, routes: cfg.routes.length }));
+    res.end(JSON.stringify({
+      ok: true, version: VERSION, defaultUpstream: cfg.defaultUpstream, routes: cfg.routes.length,
+      guard: cfg.guard ? {
+        maxConcurrent: cfg.guard.maxConcurrent, dailyBudget: cfg.guard.dailyBudget,
+        scope: cfg.guard.scope, today: Object.fromEntries(dayCounts),
+      } : null,
+    }));
     return;
   }
 
@@ -266,7 +412,9 @@ function handle(req, res) {
     if (body.length > 0) {
       try { model = JSON.parse(body.toString('utf8')).model; } catch { /* not JSON — default upstream decides */ }
     }
-    forward(req, res, body, pickUpstream(cfg, model));
+    const upstream = pickUpstream(cfg, model);
+    if (applyGuard(cfg, req, res, upstream)) return;
+    forward(req, res, body, upstream);
   });
   req.on('error', () => res.destroy());
 }
@@ -308,6 +456,10 @@ try {
 if (checkOnly) {
   process.stdout.write(`ok: ${CONFIG_FILE}\n  listen  ${config.host}:${config.port}\n  default ${config.defaultUpstream}\n`);
   for (const r of config.routes) process.stdout.write(`  route   ${r.match} -> ${r.upstream}\n`);
+  if (config.guard) {
+    process.stdout.write(`  guard   scope=${config.guard.scope} maxConcurrent=${config.guard.maxConcurrent ?? '-'} `
+      + `dailyBudget=${config.guard.dailyBudget ?? '-'} state=${config.guard.stateFile}\n`);
+  }
   process.exit(0);
 }
 
@@ -318,6 +470,9 @@ if (!LOOPBACK.has(config.host) && !AUTH_TOKEN) {
     `Put TLS in front of it too (reverse proxy) before exposing it beyond localhost.\n`);
   process.exit(1);
 }
+
+if (config.guard) loadGuardState(config.guard.stateFile);
+setInterval(() => { if (guardDirty) saveGuardState(); }, 1000).unref();
 
 const server = http.createServer(handle);
 server.requestTimeout = 0;   // long-lived streaming responses are the normal case
@@ -332,6 +487,7 @@ server.listen(config.port, config.host, () => {
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
+    if (guardDirty) saveGuardState();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 2000).unref();
   });
