@@ -284,6 +284,111 @@ router.proc.kill();
   authed.proc.kill();
 }
 
+// 13b. Budget guard: concurrency ceiling, daily budget, human reset, persistence.
+{
+  const guardState = path.join(TMP, 'guard-state.json');
+  const guardCfgPath = path.join(TMP, 'guard.json');
+  const guardCfg = {
+    listen: { host: '127.0.0.1', port: 0 },
+    defaultUpstream: `http://127.0.0.1:${A.port}`,
+    routes: [{ match: 'gpt-*', upstream: `http://127.0.0.1:${B.port}` }],
+    guard: { maxConcurrent: 1, dailyBudget: 4, stateFile: guardState },
+  };
+  fs.writeFileSync(guardCfgPath, JSON.stringify(guardCfg, null, 2));
+  const g = await startRouter(guardCfgPath);
+
+  // concurrency: two overlapping streaming completions — second is refused 403,
+  // is NOT retried-shaped (429/5xx), and does not consume the day budget.
+  const sse = { body: JSON.stringify({ model: 'gpt-x', stream: true }), headers: { 'content-type': 'application/json' } };
+  const [r1, r2] = await Promise.all([
+    request(g.port, sse),
+    new Promise((r) => setTimeout(r, 30)).then(() => request(g.port, sse)),
+  ]);
+  const denied = [r1, r2].find((r) => r.status === 403);
+  const served = [r1, r2].find((r) => r.status === 200);
+  const dj = JSON.parse(denied.body.toString());
+  check(!!denied && !!served, 'guard: second in-flight completion refused while the first streams');
+  check(dj.error?.type === 'permission_error' && dj.error.message.includes('concurrency'),
+    'guard: concurrency denial is a 403 permission_error (non-retryable)');
+
+  // count_tokens is never counted or blocked
+  const ct = await request(g.port, { path: '/v1/messages/count_tokens', body: JSON.stringify({ model: 'gpt-x' }) });
+  check(ct.status === 200, 'guard: count_tokens bypasses the guard');
+
+  // default-upstream traffic is out of scope under scope=routed
+  const cl = await request(g.port, { body: JSON.stringify({ model: 'claude-x' }) });
+  check(cl.status === 200, 'guard: default-upstream completions unguarded under scope=routed');
+
+  // daily budget: 1 used by the streamed success; 3 more sequential = 4 total; 5th refused
+  for (let i = 0; i < 3; i++) await request(g.port, { body: JSON.stringify({ model: 'gpt-x' }) });
+  const over = await request(g.port, { body: JSON.stringify({ model: 'gpt-x' }) });
+  const oj = JSON.parse(over.body.toString());
+  check(over.status === 403 && oj.error?.message.includes('daily budget'),
+    'guard: completion beyond the day budget refused with 403');
+
+  // healthz exposes today's counts
+  const hz = JSON.parse((await request(g.port, { method: 'GET', path: '/healthz' })).body.toString());
+  check(hz.guard?.today?.[`http://127.0.0.1:${B.port}`] === 4, 'guard: healthz reports today\'s count');
+
+  // human reset: delete the state file, next completion passes
+  await new Promise((r) => setTimeout(r, 1200)); // let the state flush land
+  fs.rmSync(guardState);
+  const afterReset = await request(g.port, { body: JSON.stringify({ model: 'gpt-x' }) });
+  check(afterReset.status === 200, 'guard: deleting the state file resets the day budget');
+
+  // persistence: counts survive a restart
+  await new Promise((r) => setTimeout(r, 1200)); // flush again
+  g.proc.kill();
+  await waitExit(g.proc);
+  const g2 = await startRouter(guardCfgPath);
+  const hz2 = JSON.parse((await request(g2.port, { method: 'GET', path: '/healthz' })).body.toString());
+  check(hz2.guard?.today?.[`http://127.0.0.1:${B.port}`] === 1, 'guard: day count persists across restart');
+  g2.proc.kill();
+  await waitExit(g2.proc);
+}
+
+// 13c. Circuit breaker: consecutive upstream 429s open the circuit -> local 403s.
+{
+  let rlHits = 0;
+  const RL = await new Promise((resolve) => {
+    const server = http.createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        rlHits++;
+        res.writeHead(429, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'cooling down' } }));
+      });
+    });
+    server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port }));
+  });
+  const cbCfgPath = path.join(TMP, 'breaker.json');
+  fs.writeFileSync(cbCfgPath, JSON.stringify({
+    listen: { host: '127.0.0.1', port: 0 },
+    defaultUpstream: `http://127.0.0.1:${A.port}`,
+    routes: [{ match: 'gpt-*', upstream: `http://127.0.0.1:${RL.port}` }],
+    guard: {
+      dailyBudget: 1000, stateFile: path.join(TMP, 'breaker-state.json'),
+      breakerThreshold: 3, breakerCooloffMinutes: 0.02,
+    },
+  }, null, 2));
+  const cb = await startRouter(cbCfgPath);
+
+  for (let i = 0; i < 3; i++) await request(cb.port, { body: JSON.stringify({ model: 'gpt-x' }) });
+  check(rlHits === 3, 'breaker: 429s below threshold pass through to the provider');
+  const hitsBefore = rlHits;
+  const open = await request(cb.port, { body: JSON.stringify({ model: 'gpt-x' }) });
+  const oj = JSON.parse(open.body.toString());
+  check(open.status === 403 && oj.error?.message.includes('circuit OPEN'),
+    'breaker: threshold trips -> local 403, terminal for SDK retries');
+  check(rlHits === hitsBefore, 'breaker: an open circuit sends NOTHING upstream');
+  await new Promise((r) => setTimeout(r, 1500)); // cooloff (0.02 min) elapses
+  await request(cb.port, { body: JSON.stringify({ model: 'gpt-x' }) });
+  check(rlHits === hitsBefore + 1, 'breaker: after cooloff one probe reaches the provider again');
+  cb.proc.kill();
+  await waitExit(cb.proc);
+  RL.server.close();
+}
+
 // 14. Non-loopback bind without a token refuses to start.
 {
   const openCfg = path.join(TMP, 'open.json');

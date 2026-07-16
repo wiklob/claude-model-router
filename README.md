@@ -78,6 +78,24 @@ Escape hatch: delete the `env` line and new sessions go direct to Anthropic agai
 
 **No credentials, ever, in this file.** The router carries the caller's own headers through untouched.
 
+## Budget guard (runaway-fleet protection)
+
+Optional hard stop for metered upstreams — built after an agent fleet burned a weekly provider quota in one afternoon (~25k completions). Add a `guard` block:
+
+```json
+{
+  "guard": { "maxConcurrent": 12, "dailyBudget": 3000 }
+}
+```
+
+- Counts **completion POSTs** (`/v1/messages`; `count_tokens` and `GET`s are free) per upstream.
+- `maxConcurrent` — in-flight ceiling per upstream; breaches self-heal as requests drain.
+- `dailyBudget` — completions per local calendar day per upstream; persisted in `guard-state.json` next to the config, so restarts don't reset it. A human resets a tripped budget by **deleting the state file**.
+- `scope` — `"routed"` (default: only route upstreams are guarded; Claude traffic to `defaultUpstream` is untouched) or `"all"`.
+- A breach answers **`403 permission_error`** — deliberately not `429`/`5xx`, which SDK retry logic turns into a request storm; `403` surfaces once, terminally, with a message telling the agent to stop and hand off to a human.
+- **Circuit breaker** (on whenever `guard` is set): `breakerThreshold` (default 10) consecutive provider `429`s open the circuit for `breakerCooloffMinutes` (default 15) — the router answers `403` locally, sending *nothing* upstream, then lets one probe through after the cool-off. Retry loops and job respawners die at the exit instead of hammering a provider whose limit is already exhausted. Restarting the router resets it.
+- `/healthz` reports today's per-upstream counts.
+
 ## Pairing with a translating proxy (foreign models)
 
 For non-Anthropic models, point a route at a proxy that speaks the Anthropic API surface and translates behind it — e.g. CLIProxyAPI on `localhost:8317`, holding your OpenAI/provider login. Two things to know:
