@@ -47,6 +47,15 @@ function defaultConfigPath() {
     || path.join(os.homedir(), '.config', 'claude-model-router', 'config.json');
 }
 
+// exact id, or a trailing-* prefix — the one match grammar used by routes and
+// the catalog denylist alike. Returns (id) => boolean.
+function compilePatternTest(patterns) {
+  const tests = patterns.map((p) => p.endsWith('*')
+    ? (id) => id.startsWith(p.slice(0, -1))
+    : (id) => id === p);
+  return (id) => tests.some((t) => t(id));
+}
+
 function compileRoute(r, i) {
   const patterns = Array.isArray(r?.match) ? r.match : [r?.match];
   if (!r || patterns.length === 0 || !patterns.every((p) => typeof p === 'string' && p.length > 0)
@@ -54,14 +63,24 @@ function compileRoute(r, i) {
     throw new Error(`routes[${i}]: need "match" (string or string array) and string "upstream"`);
   }
   new URL(r.upstream); // throws on a malformed upstream
-  const tests = patterns.map((p) => p.endsWith('*')
-    ? (id) => id.startsWith(p.slice(0, -1))
-    : (id) => id === p);
   return {
     match: patterns.join(', '),
     upstream: r.upstream.replace(/\/+$/, ''),
-    test: (id) => tests.some((t) => t(id)),
+    test: compilePatternTest(patterns),
   };
+}
+
+// Optional { "hide": string | string[] } — ids matching are dropped from the
+// merged GET /v1/models catalog only (harness discovery). Routing is untouched:
+// a hidden id still forwards normally if a client asks for it. Fixes duplicate
+// picker entries when an upstream advertises the same model under alias ids.
+function parseCatalog(c) {
+  if (c == null || c.hide == null) return null;
+  const patterns = Array.isArray(c.hide) ? c.hide : [c.hide];
+  if (patterns.length === 0 || !patterns.every((p) => typeof p === 'string' && p.length > 0)) {
+    throw new Error('catalog.hide: need a string or non-empty array of strings');
+  }
+  return { hidden: compilePatternTest(patterns) };
 }
 
 function parseGuard(g, file) {
@@ -105,7 +124,8 @@ function parseConfig(raw, file) {
   new URL(defaultUpstream);
   const routes = (cfg.routes || []).map(compileRoute);
   const guard = parseGuard(cfg.guard, file);
-  return { raw, host, port, defaultUpstream: defaultUpstream.replace(/\/+$/, ''), routes, guard };
+  const catalog = parseCatalog(cfg.catalog);
+  return { raw, host, port, defaultUpstream: defaultUpstream.replace(/\/+$/, ''), routes, guard, catalog };
 }
 
 // Config is re-read per request by content comparison (files this small make
@@ -395,7 +415,9 @@ async function mergedModels(req, res, cfg) {
   const data = [];
   for (const r of results) {
     for (const m of (Array.isArray(r?.json?.data) ? r.json.data : [])) {
-      if (m && typeof m.id === 'string' && !seen.has(m.id)) { seen.add(m.id); data.push(m); }
+      if (m && typeof m.id === 'string' && !seen.has(m.id) && !cfg.catalog?.hidden(m.id)) {
+        seen.add(m.id); data.push(m);
+      }
     }
   }
   const primary = results[0];

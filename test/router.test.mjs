@@ -196,6 +196,25 @@ const P = router.port;
   check(B.requests.at(-1)?.url === '/v1/models/gpt-5.6-mini', 'models: single-model lookup follows the route');
 }
 
+// 5d. catalog.hide (exact + prefix) drops ids from /v1/models only — routing untouched.
+{
+  const hideCfgPath = path.join(TMP, 'hide.json');
+  const hideCfg = structuredClone(baseConfig);
+  hideCfg.catalog = { hide: ['gpt-sol', 'shared-*'] };
+  fs.writeFileSync(hideCfgPath, JSON.stringify(hideCfg, null, 2));
+  const h = await startRouter(hideCfgPath);
+
+  const res = await request(h.port, { method: 'GET', path: '/v1/models' });
+  const ids = JSON.parse(res.body.toString()).data.map((m) => m.id);
+  check(!ids.includes('gpt-sol') && !ids.includes('shared-model'),
+    `models: catalog.hide omits matching ids (exact + prefix) from the catalog (${ids.join(',')})`);
+  check(ids.includes('claude-x') && ids.includes('gpt-1'), 'models: catalog.hide leaves unmatched ids in place');
+
+  const routed = await request(h.port, { body: JSON.stringify({ model: 'gpt-sol' }), headers: { 'content-type': 'application/json' } });
+  check(routed.headers['x-served-by'] === 'B', 'models: a hidden id still routes normally if a client asks for it');
+  h.proc.kill();
+}
+
 // 6. Non-JSON body → forwarded verbatim to default upstream (upstream's problem).
 {
   const junk = Buffer.from('this is { not json');
