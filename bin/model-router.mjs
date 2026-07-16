@@ -21,7 +21,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 // generous ceiling so a malformed client can't balloon memory; real Anthropic
 // requests are far smaller
 const MAX_BODY = 64 * 1024 * 1024;
