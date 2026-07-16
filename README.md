@@ -78,6 +78,19 @@ Escape hatch: delete the `env` line and new sessions go direct to Anthropic agai
 
 **No credentials, ever, in this file.** The router carries the caller's own headers through untouched.
 
+### Hiding models from discovery
+
+`GET /v1/models` returns the **merged** catalog of every upstream so harness model discovery sees foreign models next to Anthropic's. Some proxies advertise the same model under alias ids (e.g. a bare `luna` alongside `gpt-5.6-luna`); because the harness derives the picker label from the id, both collapse to one name and you get a **duplicate `/model` entry**. An optional `catalog.hide` list drops matching ids from that merged catalog:
+
+```json
+{
+  "catalog": { "hide": ["sol", "terra", "luna"] }
+}
+```
+
+- Same match grammar as `match` — exact id or a trailing-`*` prefix.
+- **Discovery only.** A hidden id is omitted from `GET /v1/models` but still **routes normally** if a client asks for it — nothing about completions changes.
+
 ## Budget guard (runaway-fleet protection)
 
 Optional hard stop for metered upstreams — built after an agent fleet burned a weekly provider quota in one afternoon (~25k completions). Add a `guard` block:
