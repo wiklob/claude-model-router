@@ -126,7 +126,7 @@ Single-model lookups (`GET /v1/models/<id>`) route by the id in the path. The me
 
 ### Curating the catalog
 
-Upstream catalogs are often noisy (duplicate variants, image models, internal aliases). The optional `catalog` config block shapes the merged list — **display only**, routing is never affected: a hidden model still routes and completes, it just stops appearing in pickers.
+Upstream catalogs are often noisy: some proxies advertise the same model under alias ids (e.g. a bare `luna` alongside `gpt-5.6-luna`), and because the harness derives the picker label from the id, both collapse to one name — a **duplicate `/model` entry**. The optional `catalog` config block shapes the merged list — **discovery/display only**, routing is never affected: a hidden model still routes and completes, it just stops appearing in pickers.
 
 ```json
 "catalog": {
@@ -135,7 +135,7 @@ Upstream catalogs are often noisy (duplicate variants, image models, internal al
 }
 ```
 
-- `hide` — patterns (exact id, or trailing-`*` prefix) removed from the merged `/v1/models` response.
+- `hide` — same match grammar as `match` (exact id, or trailing-`*` prefix); matching ids are removed from the merged `/v1/models` response.
 - `aliases` — model id → the `display_name` pickers show for it.
 
 Edits hot-reload like the rest of the config; reopen the `/model` picker (new session) to see the effect.

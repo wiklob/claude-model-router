@@ -196,8 +196,8 @@ const P = router.port;
   check(B.requests.at(-1)?.url === '/v1/models/gpt-5.6-mini', 'models: single-model lookup follows the route');
 }
 
-// 5d. catalog block: hide filters the merged list, aliases rewrite display_name,
-//     and hiding is display-only — the hidden id still routes.
+// 5d. catalog block: hide (exact + prefix) drops ids from /v1/models only,
+//     aliases rewrite display_name — routing untouched either way.
 {
   const edited = structuredClone(baseConfig);
   edited.catalog = { hide: ['shared-*', 'gpt-sol'], aliases: { 'gpt-1': 'GPT One' } };
@@ -205,12 +205,13 @@ const P = router.port;
   const res = await request(P, { method: 'GET', path: '/v1/models' });
   const j = JSON.parse(res.body.toString());
   const ids = j.data.map((m) => m.id);
-  check(!ids.includes('shared-model') && !ids.includes('gpt-sol') && ids.includes('claude-x') && ids.includes('gpt-1'),
-    `catalog: hidden ids absent from the merged list (${ids.join(',')})`);
+  check(!ids.includes('shared-model') && !ids.includes('gpt-sol'),
+    `catalog: hide omits matching ids (exact + prefix) from the merged list (${ids.join(',')})`);
+  check(ids.includes('claude-x') && ids.includes('gpt-1'), 'catalog: hide leaves unmatched ids in place');
   check(j.data.find((m) => m.id === 'gpt-1')?.display_name === 'GPT One',
     'catalog: alias rewrites display_name');
   const hiddenRoute = await request(P, { body: JSON.stringify({ model: 'gpt-sol' }), headers: { 'content-type': 'application/json' } });
-  check(hiddenRoute.headers['x-served-by'] === 'B', 'catalog: hidden model still routes and completes');
+  check(hiddenRoute.headers['x-served-by'] === 'B', 'catalog: a hidden id still routes normally if a client asks for it');
   fs.writeFileSync(CONFIG, JSON.stringify(baseConfig, null, 2)); // restore…
   await request(P, { method: 'GET', path: '/healthz' });         // …and apply it
 }

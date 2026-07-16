@@ -47,9 +47,13 @@ function defaultConfigPath() {
     || path.join(os.homedir(), '.config', 'claude-model-router', 'config.json');
 }
 
-// exact id, or trailing-* prefix — the one pattern syntax used everywhere
-function patternTest(p) {
-  return p.endsWith('*') ? (id) => id.startsWith(p.slice(0, -1)) : (id) => id === p;
+// exact id, or a trailing-* prefix — the one match grammar used by routes and
+// the catalog denylist alike. Returns (id) => boolean.
+function compilePatternTest(patterns) {
+  const tests = patterns.map((p) => p.endsWith('*')
+    ? (id) => id.startsWith(p.slice(0, -1))
+    : (id) => id === p);
+  return (id) => tests.some((t) => t(id));
 }
 
 function compileRoute(r, i) {
@@ -59,11 +63,34 @@ function compileRoute(r, i) {
     throw new Error(`routes[${i}]: need "match" (string or string array) and string "upstream"`);
   }
   new URL(r.upstream); // throws on a malformed upstream
-  const tests = patterns.map(patternTest);
   return {
     match: patterns.join(', '),
     upstream: r.upstream.replace(/\/+$/, ''),
-    test: (id) => tests.some((t) => t(id)),
+    test: compilePatternTest(patterns),
+  };
+}
+
+// Optional { "hide": string | string[], "aliases": { id: name } } — shapes the
+// merged GET /v1/models catalog only (harness discovery). Routing is untouched:
+// a hidden id still forwards normally if a client asks for it. `hide` fixes
+// duplicate picker entries when an upstream advertises the same model under
+// alias ids; `aliases` rewrites the display_name pickers show for an id.
+function parseCatalog(c) {
+  if (c == null) return null;
+  const hidePatterns = c.hide == null ? [] : (Array.isArray(c.hide) ? c.hide : [c.hide]);
+  if (!hidePatterns.every((p) => typeof p === 'string' && p.length > 0)) {
+    throw new Error('catalog.hide: need a string or string array of model-id patterns');
+  }
+  const aliases = c.aliases ?? {};
+  if (typeof aliases !== 'object' || Array.isArray(aliases)
+      || !Object.entries(aliases).every(([k, v]) => k.length > 0 && typeof v === 'string' && v.length > 0)) {
+    throw new Error('catalog.aliases: need an object of { "model-id": "Display Name" }');
+  }
+  if (hidePatterns.length === 0 && Object.keys(aliases).length === 0) return null;
+  return {
+    hidden: compilePatternTest(hidePatterns),
+    hideList: hidePatterns.join(', '),
+    aliases,
   };
 }
 
@@ -92,28 +119,6 @@ function parseGuard(g, file) {
     return v;
   })();
   return { maxConcurrent, dailyBudget, scope, stateFile, breakerThreshold, breakerCooloffMinutes };
-}
-
-// The catalog block shapes what GET /v1/models advertises — display only,
-// routing is never affected: a hidden model still routes and completes.
-function parseCatalog(c) {
-  if (c == null) return null;
-  const hidePatterns = c.hide == null ? [] : (Array.isArray(c.hide) ? c.hide : [c.hide]);
-  if (!hidePatterns.every((p) => typeof p === 'string' && p.length > 0)) {
-    throw new Error('catalog.hide: need a string or string array of model-id patterns');
-  }
-  const aliases = c.aliases ?? {};
-  if (typeof aliases !== 'object' || Array.isArray(aliases)
-      || !Object.entries(aliases).every(([k, v]) => k.length > 0 && typeof v === 'string' && v.length > 0)) {
-    throw new Error('catalog.aliases: need an object of { "model-id": "Display Name" }');
-  }
-  if (hidePatterns.length === 0 && Object.keys(aliases).length === 0) return null;
-  const tests = hidePatterns.map(patternTest);
-  return {
-    hide: (id) => tests.some((t) => t(id)),
-    hideList: hidePatterns.join(', '),
-    aliases,
-  };
 }
 
 function parseConfig(raw, file) {
@@ -418,19 +423,16 @@ async function mergedModels(req, res, cfg) {
   const upstreams = [cfg.defaultUpstream, ...new Set(cfg.routes.map((r) => r.upstream))];
   const results = await Promise.all(upstreams.map((u) => fetchModels(u, path, headers)));
   const seen = new Set();
-  let data = [];
+  const data = [];
+  let hidden = 0;
   for (const r of results) {
     for (const m of (Array.isArray(r?.json?.data) ? r.json.data : [])) {
-      if (m && typeof m.id === 'string' && !seen.has(m.id)) { seen.add(m.id); data.push(m); }
+      if (!m || typeof m.id !== 'string' || seen.has(m.id)) continue;
+      seen.add(m.id);
+      if (cfg.catalog?.hidden(m.id)) { hidden++; continue; }
+      const alias = cfg.catalog?.aliases[m.id];
+      data.push(alias ? { ...m, display_name: alias } : m);
     }
-  }
-  let hidden = 0;
-  if (cfg.catalog) {
-    const before = data.length;
-    data = data
-      .filter((m) => !cfg.catalog.hide(m.id))
-      .map((m) => cfg.catalog.aliases[m.id] ? { ...m, display_name: cfg.catalog.aliases[m.id] } : m);
-    hidden = before - data.length;
   }
   const primary = results[0];
   if (data.length === 0) {
