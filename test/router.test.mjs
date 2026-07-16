@@ -347,6 +347,48 @@ router.proc.kill();
   await waitExit(g2.proc);
 }
 
+// 13c. Circuit breaker: consecutive upstream 429s open the circuit -> local 403s.
+{
+  let rlHits = 0;
+  const RL = await new Promise((resolve) => {
+    const server = http.createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        rlHits++;
+        res.writeHead(429, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'cooling down' } }));
+      });
+    });
+    server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port }));
+  });
+  const cbCfgPath = path.join(TMP, 'breaker.json');
+  fs.writeFileSync(cbCfgPath, JSON.stringify({
+    listen: { host: '127.0.0.1', port: 0 },
+    defaultUpstream: `http://127.0.0.1:${A.port}`,
+    routes: [{ match: 'gpt-*', upstream: `http://127.0.0.1:${RL.port}` }],
+    guard: {
+      dailyBudget: 1000, stateFile: path.join(TMP, 'breaker-state.json'),
+      breakerThreshold: 3, breakerCooloffMinutes: 0.02,
+    },
+  }, null, 2));
+  const cb = await startRouter(cbCfgPath);
+
+  for (let i = 0; i < 3; i++) await request(cb.port, { body: JSON.stringify({ model: 'gpt-x' }) });
+  check(rlHits === 3, 'breaker: 429s below threshold pass through to the provider');
+  const hitsBefore = rlHits;
+  const open = await request(cb.port, { body: JSON.stringify({ model: 'gpt-x' }) });
+  const oj = JSON.parse(open.body.toString());
+  check(open.status === 403 && oj.error?.message.includes('circuit OPEN'),
+    'breaker: threshold trips -> local 403, terminal for SDK retries');
+  check(rlHits === hitsBefore, 'breaker: an open circuit sends NOTHING upstream');
+  await new Promise((r) => setTimeout(r, 1500)); // cooloff (0.02 min) elapses
+  await request(cb.port, { body: JSON.stringify({ model: 'gpt-x' }) });
+  check(rlHits === hitsBefore + 1, 'breaker: after cooloff one probe reaches the provider again');
+  cb.proc.kill();
+  await waitExit(cb.proc);
+  RL.server.close();
+}
+
 // 14. Non-loopback bind without a token refuses to start.
 {
   const openCfg = path.join(TMP, 'open.json');

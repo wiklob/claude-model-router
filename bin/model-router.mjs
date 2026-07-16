@@ -81,7 +81,14 @@ function parseGuard(g, file) {
   const stateFile = typeof g.stateFile === 'string' && g.stateFile.length > 0
     ? g.stateFile
     : path.join(path.dirname(file), 'guard-state.json');
-  return { maxConcurrent, dailyBudget, scope, stateFile };
+  const breakerThreshold = posInt(g.breakerThreshold, 'breakerThreshold') ?? 10;
+  const breakerCooloffMinutes = (() => {
+    const v = g.breakerCooloffMinutes;
+    if (v == null) return 15;
+    if (typeof v !== 'number' || !(v > 0)) throw new Error('guard.breakerCooloffMinutes: need a positive number');
+    return v;
+  })();
+  return { maxConcurrent, dailyBudget, scope, stateFile, breakerThreshold, breakerCooloffMinutes };
 }
 
 function parseConfig(raw, file) {
@@ -147,6 +154,37 @@ function pickUpstream(cfg, model) {
 // telling the agent to stop and hand off to a human. Humans reset a tripped
 // day budget by deleting the state file; the concurrency ceiling self-heals
 // as in-flight requests drain. Day counts persist across restarts.
+
+// Circuit breaker: a provider already rate-limiting gets NO further traffic.
+// SDK retry logic turns upstream 429s into request storms (2026-07-15: 42k
+// retries in ~10 minutes at ~100/s); after `breakerThreshold` consecutive
+// 429s from an upstream, the circuit opens and the router itself answers 403
+// (terminal, non-retried) for `breakerCooloffMinutes` — retry loops and job
+// respawners die at the exit instead of hammering a dead account.
+const breaker = new Map();    // upstream -> { strikes, openUntil }
+
+function breakerFor(upstream) {
+  let b = breaker.get(upstream);
+  if (!b) { b = { strikes: 0, openUntil: 0 }; breaker.set(upstream, b); }
+  return b;
+}
+
+function noteUpstreamStatus(cfg, upstream, status) {
+  const g = cfg.guard;
+  if (!g) return;
+  if (g.scope === 'routed' && upstream === cfg.defaultUpstream) return;
+  const b = breakerFor(upstream);
+  if (status === 429) {
+    b.strikes += 1;
+    if (b.strikes >= g.breakerThreshold && b.openUntil <= Date.now()) {
+      b.openUntil = Date.now() + g.breakerCooloffMinutes * 60_000;
+      process.stderr.write(`[model-router] guard: circuit OPEN for ${upstream} `
+        + `(${b.strikes} consecutive 429s) — answering 403 for ${g.breakerCooloffMinutes} min\n`);
+    }
+  } else if (status < 500) {
+    b.strikes = 0; // any non-429 success-ish answer closes the streak
+  }
+}
 
 const inflight = new Map();   // upstream -> live completion count
 let dayKey = '';              // local calendar day the counts belong to
@@ -216,6 +254,18 @@ function applyGuard(cfg, req, res, upstream) {
   if (g.stateFile !== guardStateFile) loadGuardState(g.stateFile);
   rollGuardDay();
 
+  const b = breakerFor(upstream);
+  if (b.openUntil > Date.now()) {
+    const mins = Math.ceil((b.openUntil - Date.now()) / 60_000);
+    guardDeny(res,
+      `model-router guard: circuit OPEN for ${upstream} — the provider answered ${b.strikes}+ `
+      + `consecutive 429s (its own limit is exhausted). HARD STOP for ~${mins} more minute(s): `
+      + 'do not retry, do not respawn agents or jobs; report to the human. '
+      + 'Restarting the router resets the circuit.',
+      'circuit-open', upstream);
+    return 'circuit-open';
+  }
+
   const live = inflight.get(upstream) ?? 0;
   if (g.maxConcurrent !== null && live >= g.maxConcurrent) {
     guardDeny(res,
@@ -277,7 +327,7 @@ function clientHeaders(reqHeaders) {
   return headers;
 }
 
-function forward(req, res, body, upstreamBase) {
+function forward(req, res, body, upstreamBase, cfg) {
   const target = targetURL(upstreamBase, req.url);
   const headers = clientHeaders(req.headers);
   if (body.length > 0 || !['GET', 'HEAD'].includes(req.method)) {
@@ -287,6 +337,7 @@ function forward(req, res, body, upstreamBase) {
   const started = Date.now();
   const mod = target.protocol === 'https:' ? https : http;
   const up = mod.request(target, { method: req.method, headers }, (upRes) => {
+    if (cfg) noteUpstreamStatus(cfg, upstreamBase, upRes.statusCode);
     const out = {};
     for (const [k, v] of Object.entries(upRes.headers)) {
       if (!HOP.has(k)) out[k] = v;
@@ -414,7 +465,7 @@ function handle(req, res) {
     }
     const upstream = pickUpstream(cfg, model);
     if (applyGuard(cfg, req, res, upstream)) return;
-    forward(req, res, body, upstream);
+    forward(req, res, body, upstream, cfg);
   });
   req.on('error', () => res.destroy());
 }
