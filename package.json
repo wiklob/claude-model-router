@@ -1,10 +1,14 @@
 {
   "name": "@wiklob/claude-model-router",
   "version": "0.4.0",
-  "publishConfig": { "access": "public" },
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Tiny local router for the Anthropic API surface: peek at the model id, forward the bytes. Claude ids pass through to Anthropic untouched; foreign ids go to your translating proxy.",
   "type": "module",
-  "bin": { "model-router": "bin/model-router.mjs" },
+  "bin": {
+    "model-router": "bin/model-router.mjs"
+  },
   "files": [
     "bin/",
     "install-launchd.sh",
@@ -24,7 +28,12 @@
     "cliproxyapi"
   ],
   "author": "wiklob",
-  "engines": { "node": ">=18" },
-  "repository": { "type": "git", "url": "https://github.com/wiklob/claude-model-router.git" },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wiklob/claude-model-router.git"
+  },
   "license": "MIT"
 }
